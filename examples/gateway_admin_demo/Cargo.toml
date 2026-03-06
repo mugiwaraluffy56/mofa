@@ -7,6 +7,10 @@ edition.workspace = true
 name = "gateway_admin_demo"
 path = "src/main.rs"
 
+[[bin]]
+name = "gateway_server"
+path = "src/server.rs"
+
 [dependencies]
 mofa-gateway = { path = "../../crates/mofa-gateway" }
 
