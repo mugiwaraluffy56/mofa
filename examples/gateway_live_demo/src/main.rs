@@ -1,6 +1,7 @@
-//! MoFA Cognitive Gateway — end-to-end live demo
+//! MoFA Cognitive Gateway - end-to-end live demo
 //!
-//! Wires together every kernel contract and foundation implementation:
+//! This wires together the kernel traits and foundation implementations
+//! into a working gateway you can actually poke with curl or the dashboard.
 //!
 //! Kernel layer (traits / types)
 //!   GatewayRoute, RouteRegistry, RequestEnvelope, AgentResponse
@@ -8,28 +9,28 @@
 //!   RoutingStrategy
 //!
 //! Foundation layer (concrete implementations)
-//!   TokenBucketRateLimiter — per-client token-bucket quota
-//!   WeightedRoundRobinRouter — proportional load balancing
-//!   CapabilityMatchRouter + AgentScorer — semantic routing
-//!   RouterRegistry — route-id → strategy map
+//!   TokenBucketRateLimiter - per-client token bucket
+//!   WeightedRoundRobinRouter - proportional load balancing across agents
+//!   CapabilityMatchRouter + AgentScorer - picks agents by what they can do
+//!   RouterRegistry - maps route ids to their strategy
 //!
 //! Endpoints
-//!   GET  /                    live HTML dashboard (auto-refreshes every 500 ms)
-//!   GET  /live/metrics        JSON metrics feed polled by the dashboard
-//!   POST /v1/invoke/{path}    full dispatch pipeline (auth → rate-limit → route → strategy → echo)
-//!   GET  /admin/health        health summary   (x-admin-key required)
-//!   GET  /admin/routes        list routes      (x-admin-key required)
-//!   POST /admin/routes        register route   (x-admin-key required)
-//!   PATCH /admin/routes/{id}  toggle enabled   (x-admin-key required)
-//!   DELETE /admin/routes/{id} deregister route (x-admin-key required)
-//!   GET  /admin/keys          list issued keys (x-admin-key required)
-//!   POST /admin/keys          issue new key    (x-admin-key required)
-//!   DELETE /admin/keys/{key}  revoke key       (x-admin-key required)
+//!   GET  /                    live dashboard, polls every 500ms
+//!   GET  /live/metrics        JSON feed for the dashboard
+//!   POST /v1/invoke/{path}    the main pipeline: auth, rate limit, route, dispatch
+//!   GET  /admin/health        quick health check (needs x-admin-key)
+//!   GET  /admin/routes        list all routes (needs x-admin-key)
+//!   POST /admin/routes        add a route (needs x-admin-key)
+//!   PATCH /admin/routes/{id}  enable or disable a route (needs x-admin-key)
+//!   DELETE /admin/routes/{id} remove a route (needs x-admin-key)
+//!   GET  /admin/keys          list api keys (needs x-admin-key)
+//!   POST /admin/keys          issue a new key (needs x-admin-key)
+//!   DELETE /admin/keys/{key}  revoke a key (needs x-admin-key)
 //!
 //! Run:
 //!   cargo run -p gateway_live_demo
 //!
-//! Then open http://127.0.0.1:8080 in your browser.
+//! Then open http://127.0.0.1:8080
 
 #![allow(dead_code)]
 
@@ -69,18 +70,14 @@ use mofa_kernel::{
     HttpMethod, RegistryError, RequestEnvelope, RouteRegistry, RoutingStrategy,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Demo constants
-// ─────────────────────────────────────────────────────────────────────────────
+// hardcoded keys for the demo, swap these out for real secrets in production
 
 const ADMIN_KEY: &str = "admin-secret-2025";
 const DEMO_KEY_ALICE: &str = "alice-key-abc123";
 const DEMO_KEY_BOB: &str = "bob-key-xyz789";
 const BIND_ADDR: &str = "127.0.0.1:8080";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// L1 Cache — in-memory TTL cache for agent responses
-// ─────────────────────────────────────────────────────────────────────────────
+// L1 cache - simple in-memory store for agent responses with TTL eviction
 
 #[derive(Debug)]
 struct CacheEntry {
@@ -114,7 +111,7 @@ impl L1Cache {
         }
     }
 
-    /// Build a deterministic cache key from route + canonicalized body.
+    // hash the route id + request body together so the same request always gets the same key
     fn make_key(route_id: &str, body: &Value) -> String {
         let canonical = body.to_string();
         let mut h = Sha256::new();
@@ -185,11 +182,9 @@ struct CacheStats {
     hit_rate_pct: u64,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MQTT Adapter — in-process pub/sub bus simulating an MQTT broker + IoT devices
-// ─────────────────────────────────────────────────────────────────────────────
+// MQTT adapter - runs an in-process broker so IoT devices work without an external MQTT server
+// the devices are tokio tasks that subscribe to a topic and reply when they get a message
 
-/// An MQTT message on the internal bus.
 #[derive(Debug, Clone)]
 struct MqttMessage {
     topic: String,
@@ -197,7 +192,7 @@ struct MqttMessage {
     correlation_id: String,
 }
 
-/// A simulated IoT device that subscribes to a topic and replies on a response topic.
+// each device knows its topic, type, and whether its online
 #[derive(Debug, Clone, Serialize)]
 struct IoTDevice {
     id: String,
@@ -207,12 +202,11 @@ struct IoTDevice {
     messages_handled: u64,
 }
 
-/// In-process MQTT broker: routes messages to registered device handlers.
 #[derive(Debug)]
 struct MqttBroker {
-    /// device_id → IoTDevice metadata
+    // device metadata indexed by device id
     devices: DashMap<String, IoTDevice>,
-    /// topic → (device_id, reply_sender)
+    // maps a topic to the device that subscribed to it
     subscriptions: DashMap<String, (String, tokio::sync::mpsc::Sender<MqttMessage>)>,
     published: AtomicU64,
     received: AtomicU64,
@@ -246,7 +240,7 @@ impl MqttBroker {
         rx
     }
 
-    /// Publish a message to a topic. Returns the response via a oneshot.
+    // send a message to whoever subscribed to this topic
     async fn publish(
         self: &Arc<Self>,
         topic: &str,
@@ -288,7 +282,8 @@ impl MqttBroker {
     }
 }
 
-/// Spawn a simulated IoT device that handles requests and replies on a response channel.
+// spawns a background task that pretends to be an IoT device
+// it sits on an mpsc channel and replies to each message via the pending response map
 fn spawn_iot_device(
     broker: Arc<MqttBroker>,
     device_id: String,
@@ -298,11 +293,11 @@ fn spawn_iot_device(
     let mut rx = broker.register_device(&device_id, &subscribe_topic, "simulated");
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            // Update handled count
+            // bump the handled counter on the device so the dashboard reflects it
             if let Some(mut dev) = broker.devices.get_mut(&device_id) {
                 dev.messages_handled += 1;
             }
-            // Build a realistic device response
+            // fake a sensor reading so the response looks real
             let response = json!({
                 "device_id": device_id,
                 "topic": msg.topic,
@@ -318,7 +313,7 @@ fn spawn_iot_device(
                 },
                 "echo": msg.payload,
             });
-            // Reply via the pending response map
+            // find the oneshot sender the invoke handler registered and fire the response back
             if let Some((_, tx)) = response_map.remove(&msg.correlation_id) {
                 let _ = tx.send(response);
             }
@@ -326,9 +321,8 @@ fn spawn_iot_device(
     });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Plugin Registry — Ed25519-signed plugin manifests with CRUD + verify
-// ─────────────────────────────────────────────────────────────────────────────
+// plugin registry - stores plugin manifests and signs them with Ed25519
+// a plugin that isnt verified cant be installed, thats the whole point
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PluginManifest {
@@ -339,16 +333,16 @@ struct PluginManifest {
     author: String,
     capabilities: Vec<String>,
     entry_point: String,
-    /// SHA-256 checksum of the plugin binary (hex)
+    // sha256 of the plugin binary so we can detect tampering
     checksum: String,
-    /// Ed25519 signature over `id|name|version|checksum` (hex), optional at publish time
+    // ed25519 sig over id|name|version|checksum - not set until someone calls /sign
     signature: Option<String>,
-    /// Whether the signature has been verified against a trusted key
+    // only true after the sig has been verified against a trusted key
     verified: bool,
 }
 
 impl PluginManifest {
-    /// The canonical bytes that get signed / verified.
+    // what we actually sign - keeps it simple and deterministic
     fn signable_bytes(&self) -> Vec<u8> {
         format!("{}|{}|{}|{}", self.id, self.name, self.version, self.checksum)
             .into_bytes()
@@ -358,9 +352,9 @@ impl PluginManifest {
 #[derive(Debug)]
 struct PluginRegistry {
     plugins: DashMap<String, PluginManifest>,
-    /// Trusted Ed25519 verifying keys (hex-encoded)
+    // keys we trust to sign plugins - in a real deployment these would come from a config file
     trusted_keys: Mutex<Vec<String>>,
-    /// The registry's own signing key (used in the demo to self-sign plugins)
+    // the registry's own keypair, used to self-sign plugins in the demo
     signing_key: SigningKey,
     installs: AtomicU64,
 }
@@ -376,12 +370,12 @@ impl PluginRegistry {
         }
     }
 
-    /// Public key of this registry instance (hex).
+    // hex encoded public key so we can add it to the trusted list
     fn public_key_hex(&self) -> String {
         hex::encode(self.signing_key.verifying_key().as_bytes())
     }
 
-    /// Register the registry's own public key as trusted.
+    // trust ourselves so we can self-sign the seeded plugins on startup
     fn trust_self(&self) {
         self.trusted_keys
             .lock()
@@ -401,7 +395,7 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// Sign a manifest with the registry key and mark it verified.
+    // sign the plugin with our key and flip verified to true
     fn sign_and_verify(&self, plugin_id: &str) -> Result<String, String> {
         let mut manifest = self.plugins
             .get(plugin_id)
@@ -416,7 +410,7 @@ impl PluginRegistry {
         Ok(sig_hex)
     }
 
-    /// Verify an externally-provided signature against trusted keys.
+    // verify a sig from an external signer - key has to be in our trusted list
     fn verify_signature(&self, plugin_id: &str, sig_hex: &str, pubkey_hex: &str) -> Result<(), String> {
         let trusted = self.trusted_keys.lock().unwrap();
         if !trusted.iter().any(|k| k == pubkey_hex) {
@@ -444,7 +438,7 @@ impl PluginRegistry {
         Ok(())
     }
 
-    /// Simulate `mofa plugin install`: verify + increment install counter.
+    // install a plugin - will fail if the sig hasnt been verified yet
     fn install(&self, plugin_id: &str) -> Result<PluginManifest, String> {
         let manifest = self.plugins
             .get(plugin_id)
@@ -477,9 +471,7 @@ impl PluginRegistry {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// InMemoryRouteRegistry — implements kernel RouteRegistry trait
-// ─────────────────────────────────────────────────────────────────────────────
+// route registry backed by a plain hashmap - good enough for a single process
 
 struct InMemoryRouteRegistry {
     routes: HashMap<String, GatewayRoute>,
@@ -492,8 +484,8 @@ impl InMemoryRouteRegistry {
         }
     }
 
-    /// Find the highest-priority enabled route whose path_pattern matches
-    /// `path` exactly.
+    // find the best matching route for this path and method
+    // if there are multiple matches we take the one with the highest priority
     fn match_path(&self, path: &str, method: &HttpMethod) -> Option<&GatewayRoute> {
         let mut candidates: Vec<&GatewayRoute> = self
             .routes
@@ -545,9 +537,7 @@ impl RouteRegistry for InMemoryRouteRegistry {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DemoApiKeyStore — implements kernel ApiKeyStore trait
-// ─────────────────────────────────────────────────────────────────────────────
+// api key store, just a hashmap for now
 
 struct DemoApiKeyStore {
     keys: HashMap<String, AuthClaims>,
@@ -584,9 +574,7 @@ impl ApiKeyStore for DemoApiKeyStore {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DemoAuthProvider — implements kernel AuthProvider trait
-// ─────────────────────────────────────────────────────────────────────────────
+// auth provider that reads x-api-key from the request headers
 
 struct DemoAuthProvider {
     store: Arc<RwLock<DemoApiKeyStore>>,
@@ -614,9 +602,8 @@ impl AuthProvider for DemoAuthProvider {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DemoAgentScorer — implements foundation AgentScorer trait
-// ─────────────────────────────────────────────────────────────────────────────
+// scores agents based on keyword matching in the task string
+// rough heuristic but works well enough for routing demo purposes
 
 struct DemoAgentScorer;
 
@@ -662,9 +649,7 @@ impl AgentScorer for DemoAgentScorer {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GatewayMetrics — live counters for the dashboard
-// ─────────────────────────────────────────────────────────────────────────────
+// atomic counters and a ring buffer of recent requests for the dashboard
 
 #[derive(Debug, Default)]
 struct GatewayMetrics {
@@ -729,9 +714,7 @@ struct MetricsSnapshot {
     recent: Vec<RecentReq>,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AppState — axum shared state
-// ─────────────────────────────────────────────────────────────────────────────
+// everything the handlers need, wrapped in Arc and passed around by axum
 
 struct AppState {
     routes: RwLock<InMemoryRouteRegistry>,
@@ -742,12 +725,10 @@ struct AppState {
     metrics: GatewayMetrics,
     started_at: Instant,
     admin_key: String,
-    // L1 cache
     cache: L1Cache,
-    // MQTT broker + pending response map
     mqtt: Arc<MqttBroker>,
+    // map of correlation_id to the oneshot sender waiting for the device to reply
     mqtt_pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<Value>>>,
-    // Plugin registry
     plugins: PluginRegistry,
 }
 
@@ -756,7 +737,7 @@ impl AppState {
         let keys = Arc::new(RwLock::new(DemoApiKeyStore::new()));
         let auth = DemoAuthProvider::new(Arc::clone(&keys));
 
-        // 10 burst, 2 req/sec sustained — easy to trigger with the stress test
+        // 10 burst then 2 per second - low enough that the stress test will hit the limit
         let rate_cfg = RateLimiterConfig {
             capacity: 10,
             refill_rate: 2,
@@ -793,9 +774,7 @@ impl AppState {
 
 type SharedState = Arc<AppState>;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: convert HeaderMap → HashMap<String,String>
-// ─────────────────────────────────────────────────────────────────────────────
+// axum gives us HeaderMap but the auth trait wants a plain HashMap, so convert it
 
 fn header_map(headers: &HeaderMap) -> HashMap<String, String> {
     headers
@@ -814,9 +793,7 @@ fn now_ms() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /
-// ─────────────────────────────────────────────────────────────────────────────
+// serve the dashboard HTML - everything is embedded in the binary so no static files needed
 
 async fn dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
@@ -831,9 +808,7 @@ async fn logo_png() -> impl IntoResponse {
     )
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /live/metrics
-// ─────────────────────────────────────────────────────────────────────────────
+// JSON snapshot polled by the dashboard every 500ms
 
 async fn live_metrics(State(state): State<SharedState>) -> Json<Value> {
     let snap = state.metrics.snapshot();
@@ -866,9 +841,7 @@ async fn live_metrics(State(state): State<SharedState>) -> Json<Value> {
     }))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /v1/invoke/{path} — full dispatch pipeline
-// ─────────────────────────────────────────────────────────────────────────────
+// main dispatch pipeline: auth -> rate limit -> route match -> cache check -> pick agent -> dispatch -> cache store
 
 async fn invoke(
     State(state): State<SharedState>,
@@ -881,7 +854,7 @@ async fn invoke(
     let path = format!("/v1/{}", invoke_path);
     let h_map = header_map(&headers);
 
-    // ── 1. Auth ───────────────────────────────────────────────────────────────
+    // 1. auth - check the api key
     let claims = match state.auth.authenticate(&h_map).await {
         Ok(c) => c,
         Err(AuthError::MissingCredentials) => {
@@ -913,7 +886,7 @@ async fn invoke(
         }
     };
 
-    // ── 2. Rate limit ─────────────────────────────────────────────────────────
+    // 2. rate limit - per-client token bucket
     let client_key = claims.subject.clone();
     match state.rate_limiter.check_and_consume(&client_key) {
         RateLimitDecision::Denied { retry_after_ms } => {
@@ -933,7 +906,7 @@ async fn invoke(
         }
     }
 
-    // ── 3. Route match ────────────────────────────────────────────────────────
+    // 3. find a route that matches this path
     let envelope = RequestEnvelope::new("", payload.clone(), IpAddr::from_str("127.0.0.1").unwrap());
     let route_id = {
         let registry = state.routes.read().unwrap();
@@ -955,7 +928,7 @@ async fn invoke(
         }
     };
 
-    // ── 4. Cache check ────────────────────────────────────────────────────────
+    // 4. check the L1 cache before we bother dispatching
     let cache_key = L1Cache::make_key(&route_id, &payload);
     if let Some(cached) = state.cache.get(&cache_key) {
         state.metrics.record_agent_hit(
@@ -978,7 +951,7 @@ async fn invoke(
         }))).into_response();
     }
 
-    // ── 5. Routing strategy ───────────────────────────────────────────────────
+    // 5. ask the routing strategy which agent to use
     let agent_id = {
         let strats = state.strategies.read().unwrap();
         strats
@@ -987,10 +960,10 @@ async fn invoke(
             .unwrap_or_else(|| "default-agent".to_string())
     };
 
-    // ── 6. Dispatch: MQTT device, OpenAI, or echo ─────────────────────────────
+    // 6. dispatch: try MQTT first, then real LLM if we have a key, else echo
     let t0 = Instant::now();
     let body = if state.mqtt.subscriptions.contains_key(&format!("mofa/requests/{}", route_id)) {
-        // MQTT dispatch path
+        // this route has an IoT device subscribed, go through MQTT
         let correlation_id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
         state.mqtt_pending.insert(correlation_id.clone(), tx);
@@ -1013,7 +986,7 @@ async fn invoke(
             Err(e) => json!({"error": e, "route_id": route_id}),
         }
     } else if agent_id.starts_with("gpt-") || agent_id.starts_with("claude-") || agent_id.starts_with("gemini-") {
-        // LLM routing path: real OpenAI call if key set, else realistic echo
+        // looks like an LLM agent - call OpenAI if we have a key otherwise simulate it
         if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
             let model = if agent_id.starts_with("gpt-") { &agent_id } else { "gpt-3.5-turbo" };
             let user_msg = payload.get("message")
@@ -1057,7 +1030,7 @@ async fn invoke(
                 Err(e) => json!({"error": e.to_string(), "agent_id": agent_id}),
             }
         } else {
-            // No API key — realistic echo simulating LLM response shape
+            // no api key set, return an echo that looks like an LLM response
             json!({
                 "agent_id": agent_id,
                 "route_id": route_id,
@@ -1070,7 +1043,7 @@ async fn invoke(
             })
         }
     } else {
-        // Generic echo dispatch
+        // anything else just echoes back the payload
         json!({
             "agent_id": agent_id,
             "route_id": route_id,
@@ -1082,7 +1055,7 @@ async fn invoke(
 
     let latency_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // ── 7. Cache store ────────────────────────────────────────────────────────
+    // 7. store the response in cache so the next identical request is instant
     state.cache.set(cache_key, body.clone(), None);
 
     let resp = AgentResponse::new(200, body.clone(), &agent_id, &envelope);
@@ -1110,9 +1083,7 @@ async fn invoke(
         .into_response()
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Admin handlers
-// ─────────────────────────────────────────────────────────────────────────────
+// admin handlers - all require x-admin-key header
 
 async fn admin_health(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
     if !state.verify_admin(&headers) {
@@ -1136,11 +1107,11 @@ struct RegisterRouteReq {
     agent_id: String,
     method: Option<String>,
     strategy: Option<String>,
-    /// For weighted_round_robin: list of (agent_id, weight) pairs
+    // for weighted_round_robin: list of (agent_id, weight) pairs
     backends: Option<Vec<BackendWeight>>,
-    /// For capability_match: fallback agent if score < threshold
+    // for capability_match: fallback agent if no one scores above the threshold
     fallback_agent: Option<String>,
-    /// Score threshold for capability_match (default 0.5)
+    // score threshold for capability_match, defaults to 0.5
     threshold: Option<f64>,
 }
 
@@ -1203,7 +1174,7 @@ async fn admin_register_route(
         return (code, Json(json!({"error": msg}))).into_response();
     }
 
-    // Attach a routing strategy
+    // attach the routing strategy based on what was requested
     let strategy_name = req.strategy.as_deref().unwrap_or("weighted_round_robin");
     let strategy: Arc<dyn RoutingStrategy> = match strategy_name {
         "capability_match" => {
@@ -1220,7 +1191,7 @@ async fn admin_register_route(
             ))
         }
         _ => {
-            // weighted_round_robin (default)
+            // weighted_round_robin is the default if nothing is specified
             let backends: Vec<(String, u32)> = req
                 .backends
                 .map(|bs| bs.into_iter().map(|b| (b.agent_id, b.weight)).collect())
@@ -1282,7 +1253,7 @@ async fn admin_deregister_route(
     }
     match state.routes.write().unwrap().deregister(&route_id) {
         Ok(()) => {
-            // strategy entry for this route_id is left in place (harmless, no traffic will hit it)
+            // leave the strategy entry in place, it wont get any traffic since the route is gone
             (StatusCode::OK, Json(json!({"deregistered": route_id}))).into_response()
         }
         Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))).into_response(),
@@ -1347,9 +1318,7 @@ async fn admin_revoke_key(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Cache admin handlers
-// ─────────────────────────────────────────────────────────────────────────────
+// cache admin endpoints - stats, clear, and per-key invalidation
 
 async fn admin_cache_stats(
     State(state): State<SharedState>,
@@ -1389,9 +1358,7 @@ async fn admin_cache_invalidate(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MQTT admin handlers
-// ─────────────────────────────────────────────────────────────────────────────
+// MQTT admin endpoints - list devices and toggle them online/offline
 
 async fn admin_mqtt_devices(
     State(state): State<SharedState>,
@@ -1427,9 +1394,7 @@ async fn admin_mqtt_device_toggle(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Plugin registry handlers
-// ─────────────────────────────────────────────────────────────────────────────
+// plugin registry endpoints - publish, sign, verify, install, search, remove
 
 #[derive(Deserialize)]
 struct PublishPluginReq {
@@ -1509,7 +1474,7 @@ async fn admin_plugin_remove(
     }
 }
 
-/// POST /admin/plugins/:id/sign — sign a plugin with the registry key (demo: self-sign)
+// sign a plugin using the registry's own key - in production youd use an external signer
 async fn admin_plugin_sign(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -1529,7 +1494,7 @@ async fn admin_plugin_sign(
     }
 }
 
-/// POST /admin/plugins/:id/verify — verify an external signature
+// verify a signature from an external key against the trusted key list
 #[derive(Deserialize)]
 struct VerifyPluginReq {
     signature: String,
@@ -1551,7 +1516,7 @@ async fn admin_plugin_verify(
     }
 }
 
-/// POST /admin/plugins/:id/install — simulate `mofa plugin install`
+// install a plugin - blocks if the plugin hasnt been verified yet
 async fn admin_plugin_install(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -1572,7 +1537,7 @@ async fn admin_plugin_install(
     }
 }
 
-/// GET /admin/plugins/search?capability=mqtt
+// search plugins by capability string - used by the dashboard filter
 async fn admin_plugin_search(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -1588,12 +1553,10 @@ async fn admin_plugin_search(
     (StatusCode::OK, Json(json!(results))).into_response()
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Startup
-// ─────────────────────────────────────────────────────────────────────────────
+// startup - seed routes, devices, plugins, then start the server
 
 fn seed_demo_data(state: &AppState) {
-    // Pre-issue two API keys
+    // issue alice and bob their keys upfront so the demo works out of the box
     {
         let mut keys = state.keys.write().unwrap();
         keys.keys.insert(
@@ -1606,7 +1569,7 @@ fn seed_demo_data(state: &AppState) {
         );
     }
 
-    // Route 1: /v1/chat → WeightedRoundRobin (gpt-4 70%, claude-3 30%)
+    // chat route: weighted round robin between gpt-4 (70%) and claude-3 (30%)
     {
         let route = GatewayRoute::new("chat", "gpt-4", "/v1/chat", HttpMethod::Post);
         state.routes.write().unwrap().register(route).unwrap();
@@ -1621,7 +1584,7 @@ fn seed_demo_data(state: &AppState) {
             .register("chat".to_string(), Arc::new(router));
     }
 
-    // Route 2: /v1/vision → CapabilityMatchRouter (vision-agent / text-agent / code-agent)
+    // vision route: capability match picks the best agent for image/vision tasks
     {
         let route = GatewayRoute::new("vision", "vision-agent", "/v1/vision", HttpMethod::Post);
         state.routes.write().unwrap().register(route).unwrap();
@@ -1638,7 +1601,7 @@ fn seed_demo_data(state: &AppState) {
             .register("vision".to_string(), Arc::new(router));
     }
 
-    // Route 3: /v1/code → CapabilityMatchRouter (code-agent preferred)
+    // code route: capability match, code-agent gets the highest score for code tasks
     {
         let route = GatewayRoute::new("code", "code-agent", "/v1/code", HttpMethod::Post);
         state.routes.write().unwrap().register(route).unwrap();
@@ -1655,11 +1618,11 @@ fn seed_demo_data(state: &AppState) {
             .register("code".to_string(), Arc::new(router));
     }
 
-    // Route 4: /v1/sensor → MQTT IoT device (temperature sensor)
+    // sensor route: goes through MQTT to the simulated temperature sensor device
     {
         let route = GatewayRoute::new("sensor", "iot-sensor", "/v1/sensor", HttpMethod::Post);
         state.routes.write().unwrap().register(route).unwrap();
-        // Register the device on the broker (topic = mofa/requests/sensor)
+        // register the device and spawn the task that handles its messages
         spawn_iot_device(
             Arc::clone(&state.mqtt),
             "temp-sensor-01".to_string(),
@@ -1668,7 +1631,7 @@ fn seed_demo_data(state: &AppState) {
         );
     }
 
-    // Route 5: /v1/actuator → MQTT IoT actuator (smart light)
+    // actuator route: MQTT to the simulated smart light actuator
     {
         let route = GatewayRoute::new("actuator", "iot-actuator", "/v1/actuator", HttpMethod::Post);
         state.routes.write().unwrap().register(route).unwrap();
@@ -1680,7 +1643,7 @@ fn seed_demo_data(state: &AppState) {
         );
     }
 
-    // Seed demo plugins
+    // seed three plugins so the registry isnt empty on startup
     {
         let plugins = [
             PluginManifest {
@@ -1723,7 +1686,7 @@ fn seed_demo_data(state: &AppState) {
         for p in plugins {
             let id = p.id.clone();
             state.plugins.publish(p).ok();
-            // Auto-sign each seeded plugin so it's ready to install
+            // auto-sign so they are ready to install without manual steps
             state.plugins.sign_and_verify(&id).ok();
         }
     }
@@ -1760,13 +1723,13 @@ async fn main() {
         )
         .route("/admin/keys", get(admin_list_keys).post(admin_issue_key))
         .route("/admin/keys/:key", delete(admin_revoke_key))
-        // Cache admin
+        // cache endpoints
         .route("/admin/cache", get(admin_cache_stats).delete(admin_cache_clear))
         .route("/admin/cache/:key", delete(admin_cache_invalidate))
-        // MQTT admin
+        // MQTT device endpoints
         .route("/admin/mqtt", get(admin_mqtt_devices))
         .route("/admin/mqtt/:id", patch(admin_mqtt_device_toggle))
-        // Plugin registry
+        // plugin registry endpoints
         .route("/admin/plugins", get(admin_plugin_list).post(admin_plugin_publish))
         .route("/admin/plugins/search", get(admin_plugin_search))
         .route("/admin/plugins/:id", get(admin_plugin_get).delete(admin_plugin_remove))
@@ -1815,9 +1778,7 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Embedded HTML dashboard
-// ─────────────────────────────────────────────────────────────────────────────
+// the dashboard is embedded directly in the binary so theres nothing to deploy
 
 
 static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -1966,11 +1927,12 @@ static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   .sp.sb .sp-badge{color:var(--blue);border-color:var(--blue);}
   .sp.sy .sp-badge{color:#92400e;border-color:var(--yellow);}
   .sp.sk .sp-badge{color:var(--black);border-color:var(--black);}
-  .sp-num{font-size:2rem;font-weight:900;line-height:1;letter-spacing:-1.5px;font-variant-numeric:tabular-nums;}
-  .sp.sr .sp-num{color:var(--red);}
-  .sp.sb .sp-num{color:var(--blue);}
-  .sp.sy .sp-num{color:#92400e;}
-  .sp.sk .sp-num{color:var(--black);}
+  .sp-num{font-size:2rem;font-weight:900;line-height:1;letter-spacing:-1.5px;font-variant-numeric:tabular-nums;
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+  .sp.sr .sp-num{background-image:linear-gradient(135deg,#FD543F,#FFC63E);}
+  .sp.sb .sp-num{background-image:linear-gradient(135deg,#1976D2,#6DCACE);}
+  .sp.sy .sp-num{background-image:linear-gradient(135deg,#FFC63E,#FB6A58);}
+  .sp.sk .sp-num{background-image:linear-gradient(135deg,#2D3748,#6DCACE);}
   .sp-hint{font-size:0.6rem;color:var(--muted);font-weight:500;}
 
   /* ─── LAYOUT ─────────────────────────────────────────────── */
@@ -2599,7 +2561,7 @@ async function refresh(){
     document.getElementById('stat-auth').textContent=m.auth_rejected;
     document.getElementById('uptime-pill').textContent='up '+hms(m.uptime_secs);
 
-    // distribution
+    // build the agent distribution bars
     const chart=document.getElementById('routing-chart');
     const agents=m.agents||{};
     const total=Object.values(agents).reduce((a,b)=>a+b,0);
@@ -2616,7 +2578,7 @@ async function refresh(){
         }).join('')+'</div>';
     }
 
-    // routes
+    // fetch routes from admin endpoint to populate the routes table
     try{
       const routes=await fetch('/admin/routes',{headers:{'x-admin-key':'admin-secret-2025'}}).then(r=>r.json());
       document.getElementById('routes-badge').textContent=(routes.length||0)+' routes';
@@ -2631,7 +2593,7 @@ async function refresh(){
       }
     }catch(_){}
 
-    // log
+    // recent requests log - reverse so newest is at the top
     const recent=(m.recent||[]).slice().reverse();
     document.getElementById('log-badge').textContent=recent.length+' entries';
     const lb=document.getElementById('recent-log');
@@ -2646,7 +2608,7 @@ async function refresh(){
         </tr>`).join('');
     }
 
-    // cache
+    // update cache card
     const cache=m.cache||{};
     document.getElementById('cache-hitrate').textContent=(cache.hit_rate_pct||0)+'%';
     document.getElementById('cache-size').textContent=cache.size||0;
@@ -2654,7 +2616,7 @@ async function refresh(){
     document.getElementById('cache-misses').textContent=cache.misses||0;
     document.getElementById('cache-badge').textContent='size '+(cache.size||0)+' · TTL 60s';
 
-    // mqtt — fetch device list from admin endpoint
+    // fetch MQTT device list separately since it needs the admin key
     try{
       const tmp2=await fetch('/admin/mqtt',{headers:{'x-admin-key':'admin-secret-2025'}});
       if(tmp2.ok){
@@ -2672,7 +2634,7 @@ async function refresh(){
       }
     }catch(_){}
 
-    // plugins — fetch from admin endpoint
+    // same for plugins
     try{
       const tmp3=await fetch('/admin/plugins',{headers:{'x-admin-key':'admin-secret-2025'}});
       if(tmp3.ok){
