@@ -87,6 +87,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent_memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mofa-foundation",
+ "mofa-kernel",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+]
+
+[[package]]
 name = "agent_with_plugins_and_rhai"
 version = "0.1.0"
 dependencies = [
@@ -673,6 +685,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "capability_discovery"
+version = "0.1.0"
+dependencies = [
+ "mofa-foundation",
+ "mofa-kernel",
+ "tokio",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -903,6 +924,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "cli_doctor_demo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "colored",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2376,6 +2408,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway_live_demo"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "mofa-foundation",
+ "mofa-kernel",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+ "uuid",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3761,6 +3810,7 @@ dependencies = [
 name = "mofa-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "clap",
@@ -3824,6 +3874,8 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "config 0.14.1",
+ "cron",
+ "dashmap 5.5.3",
  "error-stack",
  "futures",
  "infer",
@@ -3833,6 +3885,7 @@ dependencies = [
  "mofa-kernel",
  "mofa-plugins",
  "once_cell",
+ "petgraph 0.7.1",
  "qdrant-client",
  "ractor",
  "rand 0.8.5",
@@ -3941,6 +3994,7 @@ dependencies = [
  "hex",
  "lazy_static",
  "mime_guess",
+ "mofa-foundation",
  "mofa-kernel",
  "rand 0.8.5",
  "reqwest",
@@ -4702,6 +4756,8 @@ checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
 dependencies = [
  "fixedbitset 0.5.7",
  "indexmap 2.13.0",
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]
